@@ -1,0 +1,117 @@
+name: RepoToPages Build
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch to build (defaults to current ref)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch || github.ref }}
+
+      - name: Resolve project directory
+        id: resolve_project
+        run: |
+          set -e
+          PROJECT_DIR=""
+
+          if [ -z "$PROJECT_DIR" ]; then
+            if [ -f package.json ]; then
+              PROJECT_DIR="."
+            else
+              for candidate in app frontend web client; do
+                if [ -f "$candidate/package.json" ]; then
+                  PROJECT_DIR="$candidate"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            FIRST_PACKAGE_JSON=$(find . -mindepth 2 -maxdepth 5 -name package.json               -not -path "*/node_modules/*" | head -n1 || true)
+            if [ -n "$FIRST_PACKAGE_JSON" ]; then
+              PROJECT_DIR=$(dirname "$FIRST_PACKAGE_JSON")
+              PROJECT_DIR=${PROJECT_DIR#./}
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "::error::Could not find package.json in repository root or common subdirectories (app/, frontend/, web/, client/)."
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/package.json" ] && [ "$PROJECT_DIR" != "." ]; then
+            echo "::error::Resolved project directory '$PROJECT_DIR' does not contain package.json"
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using project directory: $PROJECT_DIR"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: '${{ steps.resolve_project.outputs.project_dir }}/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: ${{ steps.resolve_project.outputs.project_dir }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build
+        working-directory: ${{ steps.resolve_project.outputs.project_dir }}
+        run: npm run build
+
+      - name: Find build output
+        id: find_output
+        run: |
+          BASE_DIR="${{ steps.resolve_project.outputs.project_dir }}"
+          # Check standard output directories for index.html
+          for d in dist build out public _site .output/public .vitepress/dist storybook-static .vercel/output/static; do
+            if [ -f "$BASE_DIR/$d/index.html" ] || [ -f "$BASE_DIR/$d/index.htm" ]; then
+              echo "output_dir=$BASE_DIR/$d" >> "$GITHUB_OUTPUT"
+              echo "Found deployable output in: $BASE_DIR/$d"
+              exit 0
+            fi
+          done
+
+          # Fall back: search recursively for index.html
+          echo "Standard output directories not found or missing index.html. Searching recursively..."
+          FOUND_DIR=""
+          for f in $(find "$BASE_DIR" -name "index.html" \
+                      -not -path "*/node_modules/*" \
+                      -not -path "*/src/*" \
+                      -not -path "*/.svelte-kit/generated/*" \
+                      -printf "%h\n" 2>/dev/null | sort -u | head -5); do
+            echo "  candidate: $f"
+            if [ -z "$FOUND_DIR" ]; then
+              FOUND_DIR="$f"
+            fi
+          done
+          if [ -n "$FOUND_DIR" ]; then
+            echo "output_dir=$FOUND_DIR" >> "$GITHUB_OUTPUT"
+            echo "Discovered build output in: $FOUND_DIR"
+          else
+            echo "::error::No deployable build output found. Ensure the project produces static files (dist/, build/, out/, etc.) with an index.html."
+            exit 1
+          fi
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: ${{ steps.find_output.outputs.output_dir }}
+          if-no-files-found: error
